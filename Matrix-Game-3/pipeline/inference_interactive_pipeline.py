@@ -148,11 +148,9 @@ class MatrixGame3Pipeline:
             self.sp_size = 1
 
         self.weight_dtype = torch.bfloat16
-        self.memory_retrieval_count = config.memory_retrieval_count
         self.memory_pool_similarity_threshold = config.memory_pool_similarity_threshold
         self.memory_pool_coarse_topk = config.memory_pool_coarse_topk
         self.memory_pool = MemoryPool(
-            retrieval_count=self.memory_retrieval_count,
             similarity_threshold=self.memory_pool_similarity_threshold,
             coarse_topk=self.memory_pool_coarse_topk,
             temporal_stride=self.vae_stride[0],
@@ -469,7 +467,7 @@ class MatrixGame3Pipeline:
             dist.broadcast(img_cond, src=0)
 
         max_lat_f = (first_clip_frame - 1) // self.vae_stride[0] + 1
-        max_mem_f = self.memory_retrieval_count
+        max_mem_f = 5
         max_total_f = max_lat_f + max_mem_f
         max_seq_len = max_total_f * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
 

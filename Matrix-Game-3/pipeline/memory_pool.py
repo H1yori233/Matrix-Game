@@ -28,12 +28,10 @@ class MemorySelection:
 class MemoryPool:
     def __init__(
         self,
-        retrieval_count: int,
         similarity_threshold: float,
         coarse_topk: int,
         temporal_stride: int = 4,
     ):
-        self.retrieval_count = retrieval_count
         self.similarity_threshold = similarity_threshold
         self.coarse_topk = coarse_topk
         self.temporal_stride = temporal_stride
@@ -45,7 +43,7 @@ class MemoryPool:
     def build_query_frame_indices(self, current_end_frame_idx: int) -> List[int]:
         return [
             current_end_frame_idx - (1 + 8 * idx)
-            for idx in range(self.retrieval_count)
+            for idx in range(5)
             if current_end_frame_idx - (1 + 8 * idx) >= 0
         ]
 
