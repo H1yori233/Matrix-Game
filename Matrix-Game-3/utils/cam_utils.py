@@ -295,7 +295,14 @@ def is_inside_fov_3d_direct(points, position, rotation_matrix, fov_half_h, fov_h
 
     return in_front & in_h_fov & in_v_fov
 
-def select_memory_idx_fov(extrinsics_all, current_start_frame_idx, selected_index_base, return_confidence=False, use_gpu=False):
+def select_memory_idx_fov(
+    extrinsics_all,
+    current_start_frame_idx,
+    selected_index_base,
+    return_confidence=False,
+    use_gpu=False,
+    candidate_indices=None,
+):
     if use_gpu:
         device = extrinsics_all.device if isinstance(extrinsics_all, torch.Tensor) else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
@@ -314,7 +321,13 @@ def select_memory_idx_fov(extrinsics_all, current_start_frame_idx, selected_inde
         if current_start_frame_idx <= 1:
             return ([0] * len(selected_index_base), [0.0] * len(selected_index_base)) if return_confidence else [0] * len(selected_index_base)
 
-        candidate_indices = torch.arange(1, current_start_frame_idx, device=device)
+        if candidate_indices is None:
+            candidate_indices = torch.arange(1, current_start_frame_idx, device=device)
+        else:
+            candidate_indices = torch.tensor(candidate_indices, device=device, dtype=torch.long)
+            candidate_indices = candidate_indices[candidate_indices < current_start_frame_idx]
+            if candidate_indices.numel() == 0:
+                return ([], []) if return_confidence else []
 
         R_cand = extrinsics_tensor[candidate_indices, :3, :3]
         t_cand = extrinsics_tensor[candidate_indices, :3, 3:4]
@@ -380,12 +393,22 @@ def select_memory_idx_fov(extrinsics_all, current_start_frame_idx, selected_inde
         selected_confidence = []
         for i in selected_index_base:
             ratios = []
-            for j in range(1, current_start_frame_idx):
+            if candidate_indices is None:
+                candidate_iter = range(1, current_start_frame_idx)
+            else:
+                candidate_iter = candidate_indices
+            for j in candidate_iter:
                 ratio = cal_intersection_ratio(K, extrinsics_all[i], extrinsics_all[j], 720, 1280, near=0.0, far=30)
                 ratios.append(ratio)
+            if len(ratios) == 0:
+                continue
             ratios_arr = np.array(ratios)
             sorted_idx = np.argsort(ratios_arr)[::-1]
-            selected_index.append(sorted_idx[0])
+            best_local_idx = sorted_idx[0]
+            if candidate_indices is None:
+                selected_index.append(best_local_idx + 1)
+            else:
+                selected_index.append(int(candidate_indices[best_local_idx]))
             selected_confidence.append(ratios_arr[sorted_idx[0]])
 
         if return_confidence:

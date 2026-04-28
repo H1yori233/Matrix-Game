@@ -23,9 +23,9 @@ from wan.modules.t5 import T5EncoderModel
 from wan.modules.vae2_2 import Wan2_2_VAE
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from utils.visualize import process_video
-from utils.cam_utils import compute_relative_poses, select_memory_idx_fov, get_intrinsics, _interpolate_camera_poses_handedness
+from utils.cam_utils import compute_relative_poses, get_intrinsics
 from utils.utils import get_data, build_plucker_from_c2ws, build_plucker_from_pose, compute_all_poses_from_actions, get_extrinsics
-from utils.conditions import Bench_actions_universal
+from pipeline.memory_pool import MemoryPool
 from pipeline.vae_worker import start_vae_worker_process
 
 def get_current_action():
@@ -148,6 +148,15 @@ class MatrixGame3Pipeline:
             self.sp_size = 1
 
         self.weight_dtype = torch.bfloat16
+        self.memory_retrieval_count = config.memory_retrieval_count
+        self.memory_pool_similarity_threshold = config.memory_pool_similarity_threshold
+        self.memory_pool_coarse_topk = config.memory_pool_coarse_topk
+        self.memory_pool = MemoryPool(
+            retrieval_count=self.memory_retrieval_count,
+            similarity_threshold=self.memory_pool_similarity_threshold,
+            coarse_topk=self.memory_pool_coarse_topk,
+            temporal_stride=self.vae_stride[0],
+        )
 
         if use_base_model:
             model_ckpt_dir = os.path.join(checkpoint_dir, "base_model")
@@ -460,7 +469,7 @@ class MatrixGame3Pipeline:
             dist.broadcast(img_cond, src=0)
 
         max_lat_f = (first_clip_frame - 1) // self.vae_stride[0] + 1
-        max_mem_f = 5
+        max_mem_f = self.memory_retrieval_count
         max_total_f = max_lat_f + max_mem_f
         max_seq_len = max_total_f * lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
 
@@ -469,8 +478,8 @@ class MatrixGame3Pipeline:
 
         with torch.no_grad():
             total_frames = 0
-            all_latents_list = []
             all_videos_list = []
+            self.memory_pool.reset()
             
             for clip_idx in range(num_iterations):
                 first_clip = (clip_idx == 0)
@@ -530,14 +539,13 @@ class MatrixGame3Pipeline:
                     mouse_condition_all = mouse_condition_all[0]
                     extrinsics_all = extrinsics_all[0]
 
-                def align_frame_to_block(frame_idx):
-                    return (frame_idx - 1) // 4 * 4 + 1 if frame_idx > 0 else 1
-
                 def get_latent_idx(frame_idx):
                     return (frame_idx - 1) // 4 + 1
 
                 current_end_frame_idx = first_clip_frame if first_clip else first_clip_frame + clip_idx * (clip_frame - past_frame)
                 current_start_frame_idx = 0 if first_clip else current_end_frame_idx - clip_frame
+                latent_start_idx = get_latent_idx(current_start_frame_idx)
+                latent_end_idx = get_latent_idx(current_end_frame_idx)
 
                 c2ws_chunk = extrinsics_all[current_start_frame_idx:current_end_frame_idx]
                 src_indices = np.linspace(current_start_frame_idx, current_end_frame_idx - 1, first_clip_frame if first_clip else clip_frame)
@@ -565,62 +573,68 @@ class MatrixGame3Pipeline:
                     latent_idx = None
                     timestep_memory = None
                 else:                   
-                    if self.rank == 0:
-                        mem_end = ((current_start_frame_idx - 1) // 4 * 4 + 1) if current_start_frame_idx > 1 else 1
-                        selected_index_base = [current_end_frame_idx - o for o in range(1, 34, 8)]
-                        selected_index = select_memory_idx_fov(
-                            extrinsics_all,
-                            current_start_frame_idx,
-                            selected_index_base,
-                            use_gpu=True
-                        )
-                        selected_index[-1] = 4 
-                        selected_index_base = [current_end_frame_idx - o for o in range(1, 34, 8)]
+                    query_frame_indices = self.memory_pool.build_query_frame_indices(
+                        current_end_frame_idx
+                    )
+                    memory_selection = self.memory_pool.retrieve(
+                        query_frame_indices=query_frame_indices,
+                        plucker=plucker_no_mem,
+                        current_latent_start_idx=latent_start_idx,
+                        current_start_frame_idx=current_start_frame_idx,
+                        extrinsics_all=extrinsics_all,
+                        device=self.device,
+                        dtype=weight_dtype,
+                    )
+                    if memory_selection.x_memory is None:
+                        x_memory = None
+                        memory_mouse_condition = None
+                        memory_keyboard_condition = None
+                        latent_idx = None
+                        timestep_memory = None
                     else:
-                        selected_index = [0] * 5 
-                        selected_index_base = [current_end_frame_idx - o for o in range(1, 34, 8)]
-
-                    if dist.is_initialized():
-                        dist.broadcast_object_list(selected_index, src=0)
-                    
-                    memory_pluckers = []
-                    latent_idx = []
-                    for mem_idx, reference_idx in zip(selected_index, selected_index_base):
-
-                        l_idx = get_latent_idx(mem_idx)
-                        latent_idx.append(l_idx)
-                        
-                        mem_idx_aligned = align_frame_to_block(mem_idx)
-                        mem_block = extrinsics_all[mem_idx_aligned:mem_idx_aligned + 4]
-                        mem_src = np.linspace(mem_idx_aligned, mem_idx_aligned + 3, mem_block.shape[0])
-                        mem_tgt = np.array([mem_idx_aligned + 3], dtype=np.float32)
-                        mem_pose = _interpolate_camera_poses_handedness(
-                            src_indices=mem_src,
-                            src_rot_mat=mem_block[:, :3, :3].cpu().numpy(),
-                            src_trans_vec=mem_block[:, :3, 3].cpu().numpy(),
-                            tgt_indices=mem_tgt,
-                        )
-                        reference_pose = extrinsics_all[reference_idx:reference_idx + 1]
-                        rel_pair = torch.cat([reference_pose, mem_pose], dim=0)
-                        rel_pose = compute_relative_poses(rel_pair, framewise=False)[1:2]
-                        rel_pose_gpu = rel_pose.to(device=self.device)
-
-                        memory_pluckers.append(
-                            build_plucker_from_pose(
-                                rel_pose_gpu,
-                                base_K=base_K,
-                                target_h=target_h,
-                                target_w=target_w,
-                                lat_h=lat_h,
-                                lat_w=lat_w,
+                        memory_pluckers = []
+                        for memory_extrinsic, reference_idx in zip(
+                            memory_selection.memory_extrinsics,
+                            memory_selection.query_frame_indices,
+                        ):
+                            reference_pose = extrinsics_all[
+                                reference_idx:reference_idx + 1
+                            ].to(device=self.device, dtype=torch.float32)
+                            rel_pair = torch.cat(
+                                [reference_pose, memory_extrinsic.unsqueeze(0)],
+                                dim=0,
+                            )
+                            rel_pose = compute_relative_poses(
+                                rel_pair, framewise=False
+                            )[1:2]
+                            memory_pluckers.append(
+                                build_plucker_from_pose(
+                                    rel_pose.to(device=self.device),
+                                    base_K=base_K,
+                                    target_h=target_h,
+                                    target_w=target_w,
+                                    lat_h=lat_h,
+                                    lat_w=lat_w,
+                                )
+                            )
+                        plucker = torch.cat(memory_pluckers + [plucker], dim=2)
+                        x_memory = memory_selection.x_memory
+                        latent_idx = memory_selection.memory_latent_idx
+                        memory_mouse_condition = torch.ones(
+                            (1, len(latent_idx), 2)
+                        ).to(device=self.device, dtype=weight_dtype)
+                        memory_keyboard_condition = -torch.ones(
+                            (1, len(latent_idx), 6)
+                        ).to(device=self.device, dtype=weight_dtype)
+                        timestep_memory = x_memory.new_zeros(
+                            (
+                                1,
+                                x_memory.shape[2]
+                                * x_memory.shape[3]
+                                * x_memory.shape[4]
+                                // 4,
                             )
                         )
-                    plucker = torch.cat(memory_pluckers + [plucker], dim=2)
-                    src = torch.cat(all_latents_list, dim=2)
-                    x_memory = src[:, :, latent_idx]
-                    memory_mouse_condition = torch.ones((1, len(selected_index), 2)).to(device=self.device, dtype=weight_dtype)
-                    memory_keyboard_condition = -torch.ones((1, len(selected_index), 6)).to(device=self.device, dtype=weight_dtype)
-                    timestep_memory = x_memory.new_zeros((1, x_memory.shape[2] * x_memory.shape[3] * x_memory.shape[4] // 4))
 
                 keyboard_condition = keyboard_condition_all[:, current_start_frame_idx:current_end_frame_idx]
                 mouse_condition = mouse_condition_all[:, current_start_frame_idx:current_end_frame_idx]
@@ -630,9 +644,6 @@ class MatrixGame3Pipeline:
                 test_scheduler = FlowUniPCMultistepScheduler()
                 timesteps = test_scheduler.set_timesteps(num_inference_steps, device=self.device, shift=shift)
                 timesteps = test_scheduler.timesteps
-                
-                latent_start_idx = get_latent_idx(current_start_frame_idx)
-                latent_end_idx = get_latent_idx(current_end_frame_idx)
 
                 latents = torch.randn((1, 48, latent_end_idx - latent_start_idx, img_cond.shape[-2], img_cond.shape[-1]), generator=generator, device=self.device, dtype=weight_dtype)
                 latents = torch.cat([img_cond, latents[:, :, img_cond.shape[2]:]], dim = 2)
@@ -751,8 +762,26 @@ class MatrixGame3Pipeline:
                         config = (keyboard_condition_curr.squeeze(0).float().cpu().numpy(), mouse_condition_curr.squeeze(0).float().cpu().numpy())
                         process_video(video_np.astype(np.uint8), f"{self.output_dir}/{save_name}_current_iteration_{clip_idx}.mp4", config, mouse_icon, mouse_scale=0.2, default_frame_res=(height, width),)
                         all_videos_list.append(video.cpu())
-                        
-                all_latents_list.append(denoised_pred)
+
+                if first_clip:
+                    stored_latents = denoised_pred[:, :, 1:]
+                    stored_latent_start_idx = 1
+                else:
+                    stored_latents = denoised_pred
+                    stored_latent_start_idx = latent_end_idx - stored_latents.shape[2]
+                stored_plucker_start_idx = stored_latent_start_idx - latent_start_idx
+                stored_plucker = plucker_no_mem[
+                    :,
+                    :,
+                    stored_plucker_start_idx:stored_plucker_start_idx + stored_latents.shape[2],
+                ]
+                self.memory_pool.add_clip(
+                    latents=stored_latents,
+                    plucker=stored_plucker,
+                    latent_start_idx=stored_latent_start_idx,
+                    extrinsics_all=extrinsics_all,
+                )
+
                 current_frames = 57 if first_clip else 40
                 total_frames += current_frames
 

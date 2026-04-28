@@ -31,3 +31,6 @@ matrix_game3.sample_shift = 5.0
 matrix_game3.num_inference_steps = 50
 matrix_game3.sample_guide_scale = 5.0
 matrix_game3.sample_neg_prompt = 'Vibrant colors, overexposure, static, blurred details, subtitles, style, artwork, painting, still image, overall grayness, worst quality, low quality, JPEG compression residue, ugly, mutilated, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, malformed limbs, fused fingers, still image, cluttered background, three legs, crowded background, walking backwards'
+matrix_game3.memory_retrieval_count = 5
+matrix_game3.memory_pool_similarity_threshold = 0.995
+matrix_game3.memory_pool_coarse_topk = 32
