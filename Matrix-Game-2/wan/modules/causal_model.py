@@ -161,6 +161,22 @@ class CausalWanSelfAttention(nn.Module):
            
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
+            if kv_cache.get("compact_mode", False):
+                context_end_index = kv_cache["context_end_index"].item()
+                local_start_index = context_end_index
+                local_end_index = context_end_index + num_new_tokens
+                kv_cache["k"][:, local_start_index:local_end_index] = roped_key
+                kv_cache["v"][:, local_start_index:local_end_index] = v
+                x = attention(
+                    roped_query,
+                    kv_cache["k"][:, :local_end_index],
+                    kv_cache["v"][:, :local_end_index],
+                )
+                kv_cache["global_end_index"].fill_(current_end)
+                kv_cache["local_end_index"].fill_(local_end_index)
+                x = x.flatten(2)
+                x = self.o(x)
+                return x
             
             if (current_end > kv_cache["global_end_index"].item()) and (
                     num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
@@ -363,6 +379,7 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                  num_layers=30,
                  local_attn_size=-1,
                  sink_size=0,
+                 recent_attn_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
                  action_config={},
@@ -397,6 +414,8 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
                 Window size for temporal local attention (-1 indicates global attention)
             sink_size (`int`, *optional*, defaults to 0):
                 Size of the attention sink, we keep the first `sink_size` frames unchanged when rolling the KV cache
+            recent_attn_size (`int`, *optional*, defaults to 0):
+                Number of recent latent frames reserved in compact cache mode.
             qk_norm (`bool`, *optional*, defaults to True):
                 Enable query/key normalization
             cross_attn_norm (`bool`, *optional*, defaults to False):
@@ -421,6 +440,15 @@ class CausalWanModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapte
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.local_attn_size = local_attn_size
+        self.sink_size = sink_size
+        self.recent_attn_size = recent_attn_size
+        if self.recent_attn_size > 0 and self.local_attn_size != -1:
+            self.history_attn_size = max(
+                0,
+                self.local_attn_size - self.sink_size - self.recent_attn_size,
+            )
+        else:
+            self.history_attn_size = 0
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
         self.eps = eps

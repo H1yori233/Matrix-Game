@@ -10,6 +10,15 @@ from utils.visualize import process_video
 import torch.nn.functional as F
 from demo_utils.constant import ZERO_VAE_CACHE
 from tqdm import tqdm
+from pipeline.history_pool import (
+    HistoryPool,
+    build_compact_conditions,
+    build_context_latents,
+)
+from utils.camera_memory import (
+    build_frame_extrinsics_from_conditions,
+    latent_idx_to_frame_idx,
+)
 
 def get_current_action(mode="universal"):
 
@@ -131,7 +140,207 @@ def cond_current(conditional_dict, current_start_frame, num_frame_per_block, rep
     else:
         return new_cond
 
-class CausalInferencePipeline(torch.nn.Module):
+
+class _SegmentedCacheMixin:
+    def _init_segmented_cache_state(self):
+        self.sink_size = getattr(self.generator.model, "sink_size", 0)
+        self.recent_attn_size = getattr(self.generator.model, "recent_attn_size", 0)
+        self.history_attn_size = getattr(self.generator.model, "history_attn_size", 0)
+        self.segmented_cache_enabled = (
+            self.local_attn_size != -1 and self.recent_attn_size > 0
+        )
+        self.history_pool = HistoryPool() if self.segmented_cache_enabled else None
+
+    def _use_segmented_cache(self, mode: str) -> bool:
+        return self.segmented_cache_enabled and mode == "universal"
+
+    def _cache_frame_capacity(self) -> int:
+        if self.segmented_cache_enabled:
+            return self.local_attn_size + self.num_frame_per_block
+        return self.local_attn_size
+
+    def _reset_temporal_kv_cache(self, device):
+        for block_cache in self.kv_cache1:
+            block_cache["global_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["local_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["context_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["compact_mode"] = False
+        for block_cache in self.kv_cache_mouse:
+            block_cache["global_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["local_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["context_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["compact_mode"] = False
+        for block_cache in self.kv_cache_keyboard:
+            block_cache["global_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["local_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["context_end_index"] = torch.tensor(
+                [0], dtype=torch.long, device=device
+            )
+            block_cache["compact_mode"] = False
+
+    def _set_compact_cache_metadata(self, context_entries):
+        context_frames = len(context_entries)
+        sink_frames = 1 if context_entries and context_entries[0].latent_idx == 0 else 0
+        recent_frames = min(
+            self.recent_attn_size,
+            max(0, context_frames - sink_frames),
+        )
+        history_frames = max(0, context_frames - sink_frames - recent_frames)
+
+        token_context = context_frames * self.frame_seq_length
+        for block_cache in self.kv_cache1:
+            block_cache["compact_mode"] = True
+            block_cache["context_end_index"].fill_(token_context)
+            block_cache["sink_frames"] = sink_frames
+            block_cache["history_frames"] = history_frames
+            block_cache["recent_frames"] = recent_frames
+        for block_cache in self.kv_cache_mouse:
+            block_cache["compact_mode"] = True
+            block_cache["context_end_index"].fill_(context_frames)
+            block_cache["sink_frames"] = sink_frames
+            block_cache["history_frames"] = history_frames
+            block_cache["recent_frames"] = recent_frames
+        for block_cache in self.kv_cache_keyboard:
+            block_cache["compact_mode"] = True
+            block_cache["context_end_index"].fill_(context_frames)
+            block_cache["sink_frames"] = sink_frames
+            block_cache["history_frames"] = history_frames
+            block_cache["recent_frames"] = recent_frames
+
+    def _collect_context_entries(self, current_start_frame, extrinsics_all):
+        if (
+            self.history_pool is None
+            or current_start_frame <= 0
+            or len(self.history_pool.entries) == 0
+        ):
+            return []
+
+        context_entries = []
+        sink_entry = self.history_pool.get_entry(0)
+        if sink_entry is not None:
+            context_entries.append(sink_entry)
+
+        recent_entries = self.history_pool.get_recent_entries(
+            current_start_frame,
+            self.recent_attn_size,
+        )
+        excluded_latent_indices = {entry.latent_idx for entry in context_entries}
+        recent_entries = [
+            entry
+            for entry in recent_entries
+            if entry.latent_idx not in excluded_latent_indices
+        ]
+        excluded_latent_indices.update(entry.latent_idx for entry in recent_entries)
+
+        current_frame_idx = latent_idx_to_frame_idx(current_start_frame)
+        current_extrinsic = extrinsics_all[current_frame_idx]
+        history_entries = self.history_pool.select_history_entries(
+            current_start_idx=current_start_frame,
+            current_extrinsic=current_extrinsic,
+            excluded_latent_indices=excluded_latent_indices,
+            max_history=self.history_attn_size,
+            device=current_extrinsic.device,
+        )
+        return context_entries + history_entries + recent_entries
+
+    def _prepare_segmented_inputs(
+        self,
+        context_entries,
+        current_start_frame,
+        current_num_frames,
+        conditional_dict,
+        mode,
+        device,
+        dtype,
+    ):
+        current_latent_indices = list(
+            range(current_start_frame, current_start_frame + current_num_frames)
+        )
+        compact_conditions = build_compact_conditions(
+            context_entries=context_entries,
+            current_latent_indices=current_latent_indices,
+            conditional_dict=conditional_dict,
+            device=device,
+            dtype=dtype,
+        )
+
+        self._reset_temporal_kv_cache(device)
+        context_frames = len(context_entries)
+        if context_frames > 0:
+            replay_latents = build_context_latents(
+                context_entries,
+                device=device,
+                dtype=dtype,
+            )
+            replay_cond = cond_current(
+                compact_conditions,
+                0,
+                context_frames,
+                mode=mode,
+            )
+            replay_timestep = torch.ones(
+                [replay_latents.shape[0], context_frames],
+                device=device,
+                dtype=torch.int64,
+            ) * self.args.context_noise
+            original_num_frame_per_block = self.generator.model.num_frame_per_block
+            self.generator.model.num_frame_per_block = context_frames
+            try:
+                self.generator(
+                    noisy_image_or_video=replay_latents,
+                    conditional_dict=replay_cond,
+                    timestep=replay_timestep,
+                    kv_cache=self.kv_cache1,
+                    kv_cache_mouse=self.kv_cache_mouse,
+                    kv_cache_keyboard=self.kv_cache_keyboard,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=0,
+                )
+            finally:
+                self.generator.model.num_frame_per_block = original_num_frame_per_block
+
+        self._set_compact_cache_metadata(context_entries)
+        current_cond = cond_current(
+            compact_conditions,
+            context_frames,
+            current_num_frames,
+            mode=mode,
+        )
+        return current_cond, context_frames * self.frame_seq_length
+
+    def _add_generated_block_to_history(
+        self,
+        denoised_pred,
+        conditional_dict,
+        extrinsics_all,
+        latent_start_idx,
+    ):
+        if self.history_pool is None:
+            return
+        self.history_pool.add_generated_block(
+            latents=denoised_pred,
+            conditional_dict=conditional_dict,
+            extrinsics_all=extrinsics_all,
+            latent_start_idx=latent_start_idx,
+        )
+
+class CausalInferencePipeline(_SegmentedCacheMixin, torch.nn.Module):
     def __init__(
             self,
             args,
@@ -163,6 +372,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = self.generator.model.local_attn_size
         assert self.local_attn_size != -1
+        self._init_segmented_cache_state()
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
         if self.num_frame_per_block > 1:
@@ -212,6 +422,8 @@ class CausalInferencePipeline(torch.nn.Module):
         vae_cache = copy.deepcopy(ZERO_VAE_CACHE)
         for j in range(len(vae_cache)):
             vae_cache[j] = None
+        if self.history_pool is not None:
+            self.history_pool.reset()
 
         self.kv_cache1 = self.kv_cache_keyboard = self.kv_cache_mouse = self.crossattn_cache=None
         # Step 1: Initialize KV cache to all zeros
@@ -250,6 +462,13 @@ class CausalInferencePipeline(torch.nn.Module):
                     [0], dtype=torch.long, device=noise.device)
                 self.kv_cache_keyboard[block_index]["local_end_index"] = torch.tensor(
                     [0], dtype=torch.long, device=noise.device)
+        extrinsics_all = None
+        if self._use_segmented_cache(mode):
+            extrinsics_all = build_frame_extrinsics_from_conditions(
+                conditional_dict["keyboard_cond"],
+                conditional_dict.get("mouse_cond"),
+                num_output_frames,
+            ).to(device=noise.device, dtype=torch.float32)
         # Step 2: Cache context feature
         current_start_frame = 0
         if initial_latent is not None:
@@ -285,6 +504,28 @@ class CausalInferencePipeline(torch.nn.Module):
 
             noisy_input = noise[
                 :, :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
+            if self._use_segmented_cache(mode):
+                context_entries = self._collect_context_entries(
+                    current_start_frame,
+                    extrinsics_all,
+                )
+                current_cond, model_current_start = self._prepare_segmented_inputs(
+                    context_entries=context_entries,
+                    current_start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                    conditional_dict=conditional_dict,
+                    mode=mode,
+                    device=noise.device,
+                    dtype=noise.dtype,
+                )
+            else:
+                current_cond = cond_current(
+                    conditional_dict,
+                    current_start_frame,
+                    self.num_frame_per_block,
+                    mode=mode,
+                )
+                model_current_start = current_start_frame * self.frame_seq_length
 
             # Step 3.1: Spatial denoising loop
             if profile:
@@ -300,13 +541,13 @@ class CausalInferencePipeline(torch.nn.Module):
                 if index < len(self.denoising_step_list) - 1:
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
+                        conditional_dict=current_cond,
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         kv_cache_mouse=self.kv_cache_mouse,
                         kv_cache_keyboard=self.kv_cache_keyboard,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=model_current_start
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -320,13 +561,13 @@ class CausalInferencePipeline(torch.nn.Module):
                     # for getting real output
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
+                        conditional_dict=current_cond,
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         kv_cache_mouse=self.kv_cache_mouse,
                         kv_cache_keyboard=self.kv_cache_keyboard,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=model_current_start
                     )
 
             # Step 3.2: record the model's output
@@ -337,14 +578,21 @@ class CausalInferencePipeline(torch.nn.Module):
             
             self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, mode=mode),
+                conditional_dict=current_cond,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 kv_cache_mouse=self.kv_cache_mouse,
                 kv_cache_keyboard=self.kv_cache_keyboard,
                 crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
+                current_start=model_current_start,
             )
+            if self._use_segmented_cache(mode):
+                self._add_generated_block_to_history(
+                    denoised_pred=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    extrinsics_all=extrinsics_all,
+                    latent_start_idx=current_start_frame,
+                )
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
@@ -372,10 +620,8 @@ class CausalInferencePipeline(torch.nn.Module):
         """
         kv_cache1 = []
         if self.local_attn_size != -1:
-            # Use the local attention size to compute the KV cache size
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            kv_cache_size = self._cache_frame_capacity() * self.frame_seq_length
         else:
-            # Use the default KV cache size
             kv_cache_size = 15 * 1 * self.frame_seq_length # 32760
 
         for _ in range(self.num_transformer_blocks):
@@ -383,7 +629,9 @@ class CausalInferencePipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "context_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "compact_mode": False,
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
@@ -395,7 +643,7 @@ class CausalInferencePipeline(torch.nn.Module):
         kv_cache_mouse = []
         kv_cache_keyboard = []
         if self.local_attn_size != -1:
-            kv_cache_size = self.local_attn_size
+            kv_cache_size = self._cache_frame_capacity()
         else:
             kv_cache_size = 15 * 1
         for _ in range(self.num_transformer_blocks):
@@ -403,13 +651,17 @@ class CausalInferencePipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "context_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "compact_mode": False,
             })
             kv_cache_mouse.append({
                 "k": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "context_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "compact_mode": False,
             })
         self.kv_cache_keyboard = kv_cache_keyboard  # always store the clean cache
         self.kv_cache_mouse = kv_cache_mouse  # always store the clean cache
@@ -431,7 +683,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.crossattn_cache = crossattn_cache
 
 
-class CausalInferenceStreamingPipeline(torch.nn.Module):
+class CausalInferenceStreamingPipeline(_SegmentedCacheMixin, torch.nn.Module):
     def __init__(
             self,
             args,
@@ -463,6 +715,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.local_attn_size = self.generator.model.local_attn_size
         assert self.local_attn_size != -1
+        self._init_segmented_cache_state()
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
         if self.num_frame_per_block > 1:
@@ -513,6 +766,8 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         vae_cache = copy.deepcopy(ZERO_VAE_CACHE)
         for j in range(len(vae_cache)):
             vae_cache[j] = None
+        if self.history_pool is not None:
+            self.history_pool.reset()
         # Set up profiling if requested
         self.kv_cache1=self.kv_cache_keyboard=self.kv_cache_mouse=self.crossattn_cache=None
         # Step 1: Initialize KV cache to all zeros
@@ -585,6 +840,28 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
 
             current_actions = get_current_action(mode=mode)
             new_act, conditional_dict = cond_current(conditional_dict, current_start_frame, self.num_frame_per_block, replace=current_actions, mode=mode)
+            if self._use_segmented_cache(mode):
+                extrinsics_all = build_frame_extrinsics_from_conditions(
+                    conditional_dict["keyboard_cond"],
+                    conditional_dict.get("mouse_cond"),
+                    current_start_frame + current_num_frames,
+                ).to(device=noise.device, dtype=torch.float32)
+                context_entries = self._collect_context_entries(
+                    current_start_frame,
+                    extrinsics_all,
+                )
+                current_cond, model_current_start = self._prepare_segmented_inputs(
+                    context_entries=context_entries,
+                    current_start_frame=current_start_frame,
+                    current_num_frames=current_num_frames,
+                    conditional_dict=conditional_dict,
+                    mode=mode,
+                    device=noise.device,
+                    dtype=noise.dtype,
+                )
+            else:
+                current_cond = new_act
+                model_current_start = current_start_frame * self.frame_seq_length
             # Step 3.1: Spatial denoising loop
 
             for index, current_timestep in enumerate(self.denoising_step_list):
@@ -597,13 +874,13 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                 if index < len(self.denoising_step_list) - 1:
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=new_act,
+                        conditional_dict=current_cond,
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         kv_cache_mouse=self.kv_cache_mouse,
                         kv_cache_keyboard=self.kv_cache_keyboard,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=model_current_start
                     )
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -617,13 +894,13 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                     # for getting real output
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
-                        conditional_dict=new_act,
+                        conditional_dict=current_cond,
                         timestep=timestep,
                         kv_cache=self.kv_cache1,
                         kv_cache_mouse=self.kv_cache_mouse,
                         kv_cache_keyboard=self.kv_cache_keyboard,
                         crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length
+                        current_start=model_current_start
                     )
 
             # Step 3.2: record the model's output
@@ -634,14 +911,21 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
             
             self.generator(
                 noisy_image_or_video=denoised_pred,
-                conditional_dict=new_act,
+                conditional_dict=current_cond,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 kv_cache_mouse=self.kv_cache_mouse,
                 kv_cache_keyboard=self.kv_cache_keyboard,
                 crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
+                current_start=model_current_start,
             )
+            if self._use_segmented_cache(mode):
+                self._add_generated_block_to_history(
+                    denoised_pred=denoised_pred,
+                    conditional_dict=conditional_dict,
+                    extrinsics_all=extrinsics_all,
+                    latent_start_idx=current_start_frame,
+                )
 
             # Step 3.4: update the start and end frame indices
             denoised_pred = denoised_pred.transpose(1,2)
@@ -694,10 +978,8 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         """
         kv_cache1 = []
         if self.local_attn_size != -1:
-            # Use the local attention size to compute the KV cache size
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            kv_cache_size = self._cache_frame_capacity() * self.frame_seq_length
         else:
-            # Use the default KV cache size
             kv_cache_size = 15 * 1 * self.frame_seq_length # 32760
 
         for _ in range(self.num_transformer_blocks):
@@ -705,7 +987,9 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "context_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "compact_mode": False,
             })
 
         self.kv_cache1 = kv_cache1  # always store the clean cache
@@ -717,7 +1001,7 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
         kv_cache_mouse = []
         kv_cache_keyboard = []
         if self.local_attn_size != -1:
-            kv_cache_size = self.local_attn_size
+            kv_cache_size = self._cache_frame_capacity()
         else:
             kv_cache_size = 15 * 1
         for _ in range(self.num_transformer_blocks):
@@ -725,13 +1009,17 @@ class CausalInferenceStreamingPipeline(torch.nn.Module):
                 "k": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "context_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "compact_mode": False,
             })
             kv_cache_mouse.append({
                 "k": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "v": torch.zeros([batch_size * self.frame_seq_length, kv_cache_size, 16, 64], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
-                "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
+                "local_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "context_end_index": torch.tensor([0], dtype=torch.long, device=device),
+                "compact_mode": False,
             })
         self.kv_cache_keyboard = kv_cache_keyboard  # always store the clean cache
         self.kv_cache_mouse = kv_cache_mouse  # always store the clean cache

@@ -44,6 +44,7 @@
   "num_heads": 12,
   "num_layers": 30,
   "out_dim": 16,
-  "sink_size": 0,
+  "recent_attn_size": 2,
+  "sink_size": 1,
   "text_len": 512
 }
